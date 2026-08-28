@@ -15,9 +15,11 @@
 import asyncio
 import argparse
 import sys
+import json # 序列化/反序列化
 from pathlib import Path
-import json    # 序列化/反序列化
+
 import  aiohttp
+from tqdm import tqdm # 加进度条功能
 # from anthropic import AsyncAnthropic  不兼容DEEPSEEK
 
 from config import Config
@@ -158,7 +160,38 @@ class CodeExplainer:
         
         return prompt
     
-    async def explain_code(self, code:str, file_path:str, line_range: str = None):
+    def _estimate_tokens(self, text: str) -> int:
+        """粗略估计token数(1 token ≈ 1.5个中文字符)"""
+        chinese_chars = len([c for c in text if '\u4e00' <= c <= "\u9fff"]) # Unicode中文字符范围
+        english_chars = len([c for c in text if c.isalpha()])
+        
+        # 中文: 1.5字符/token, 英文: 4字符/token
+        estimated = (chinese_chars / 1.5) + (english_chars / 4)
+        return int(estimated)
+    
+    def _calculate_cost(self, input_tokens: int, output_tokens: int) -> dict:
+        """计算API调用成本
+        
+        deepseek-v4-flash定价 (高峰时段):
+        -输入： 0.0001 / K tokens (缓存命中)
+        -输出:  0.009元 / K tokens
+            
+        """
+        input_cost = (input_tokens / 1000) *  0.0001
+        output_cost = (output_tokens / 1000) * 0.009
+        total_cost = input_cost + output_cost
+        
+        return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "input_cost_cny": input_cost,
+        "output_cost_cny": output_cost,
+        "total_cost_cny": total_cost,
+        "total_cost_usd": total_cost / 7.2  # 假设汇率
+    }
+    
+    async def explain_code(self, code:str, file_path:str, line_range: str = None, output_file: str = None):
         """
         调用AI解释代码(流式输出)
         
@@ -169,10 +202,17 @@ class CodeExplainer:
         """
         # 构建提示词
         prompt = self._build_prompt(code, file_path, line_range)
+        # 估算输入token
+        input_tokens = self._estimate_tokens(prompt)
         
         print("\n" + "=" * 70)
         print("🤖 AI 分析结果")
         print("=" * 70 + "\n")
+        print("⏳ 分析中，请稍候...\n") 
+        
+        # ✅ 用于保存结果
+        full_response = []
+        char_count = 0
         
         try:
             # ✅ 构建请求payload(OpenAI格式)
@@ -184,71 +224,139 @@ class CodeExplainer:
                 "stream": True   # 流式输出
             }
             
-            # ✅ 用 aiohttp 发起异步HTTP请求
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    self.api_url,
-                    headers=self.headers,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=60)
-                ) as  response:
-                    
-                    # 检查HTTP状态码
-                    if response.status != 200:
-                        error_text = await response.text()
-                        raise Exception(f"HTTP {response.status}: {error_text}")
-                    
-                    # ✅ 流式读取响应（SSE格式）
-                    # 改进： 按行读取
-                    buffer = ""
-                    async for line in response.content:
-                       
-                        line = line.decode('utf-8').strip()
+            # ✅ 添加进度条
+            with tqdm(
+                desc="📊 进度", 
+                unit="字", 
+                leave=False, # 完成后自动清除
+                mininterval=0.5, # 减少刷新，每0.5秒刷新一次
+                bar_format='{desc}: {n}字 | 用时{elapsed} ' # 简化格式
+                ) as pbar:
+                
+                # ✅ 用 aiohttp 发起异步HTTP请求
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        self.api_url,
+                        headers=self.headers,
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=60)
+                    ) as  response:
                         
-     
-                        # 跳过空行
-                        if not line:
-                            continue
-                        
-                        # SSE格式: 每行以"data: "开头
-                        if not line.startswith("data: "):
-                            continue
-                        
-                        data = line[6:]   # 去掉前缀
-                        
-                        # 检查结束标志    
-                        if data == "[DONE]":
-                            break
+                        # 检查HTTP状态码
+                        if response.status != 200:
+                            error_text = await response.text()
                             
-                        try:
-                            # 解析JSON
-                            chunk = json.loads(data)
+                            # ✅ 替换成详细错误处理
+                            if response.stats == 401:
+                                raise RuntimeError(
+                                    "API认证失败\n"
+                                    "请检查:\n"
+                                    "1. .env文件中的DEEPSEEK_API_KEY是否正确\n"
+                                    "2. API Key是否有效（未过期/未欠费）"
+                                )
+                            elif response.status == 429:
+                                raise RuntimeError(
+                                    "请求频率超限\n"
+                                    "请稍后再试，或升级API套餐"
+                                )
+                            elif response.status == 500:
+                                raise RuntimeError(
+                                    "服务器错误\n"
+                                    "Deepseek服务暂时不可用，请稍后重试"
+                                )
+                            else:
+                                raise RuntimeError(
+                                    f"HTTP {response.status}: {error_text}\n"
+                                    "详细错误信息请查看上方"
+                                )
                             
-                            # 提取内容(OpenAI格式)
-                            if "choices" in chunk and len(chunk["choices"]) > 0 :
-                                delta = chunk["choices"][0].get("delta", {})
-                                content = delta.get("content", "")
+                        
+                        # ✅ 流式读取响应（SSE格式）
+                        # 改进： 按行读取
+                        buffer = ""
+                        async for line in response.content:
+                        
+                            line = line.decode('utf-8').strip()
+                            
+        
+                            # 跳过空行
+                            if not line:
+                                continue
+                            
+                            # SSE格式: 每行以"data: "开头
+                            if not line.startswith("data: "):
+                                continue
+                            
+                            data = line[6:]   # 去掉前缀
+                            
+                            # 检查结束标志    
+                            if data == "[DONE]":
+                                break
                                 
-                                # 实时输出
-                                if content:
-                                    print(content, end="", flush=True)
+                            try:
+                                # 解析JSON
+                                chunk = json.loads(data)
+                                
+                                # 提取内容(OpenAI格式)
+                                if "choices" in chunk and len(chunk["choices"]) > 0 :
+                                    delta = chunk["choices"][0].get("delta", {})
+                                    content = delta.get("content", "")
                                     
-                        except json.JSONDecodeError:
-                            #忽略无效JSON行
-                            continue
-                        
+                                    # 实时输出
+                                    if content:
+                                        pbar.update(len(content))
+                                        # ⭐ 使用 tqdm.write() 输出内容(防止与进度条混合)
+                                        pbar.write(content, end="")
+                                        full_response.append(content) # 收集响应
+                                        char_count += len(content)
+                                        
+                            except json.JSONDecodeError as e:
+                                #忽略无效JSON行
+                                print(f"\n⚠️  警告: 跳过无效JSON数据", file=sys.stderr)
+                                continue
+            
+            # 计算输出token  
+            response_text = "".join(full_response)
+            output_tokens = self._estimate_tokens(response_text)
+                   
             print("\n\n" + "=" * 70)
             print("✅ 分析完成")
+            
+            # ✅ 显示统计信息
+            cost_info = self._calculate_cost(input_tokens, output_tokens)
+            print(f"\n📊 统计信息:")
+            print(f"  • 输出字符数: {char_count}")
+            print(f"  • 输入 tokens: {cost_info['input_tokens']}")
+            print(f"  • 输出 tokens: {cost_info['output_tokens']}")
+            print(f"  • 总计 tokens: {cost_info['total_tokens']}")
+            print(f"  • 预估成本: ¥{cost_info['total_cost_cny']:.4f} (${cost_info['total_cost_usd']:.4f})")
+            
+            # ✅ 保存到文件
+            if output_file:
+                Path(output_file).write_text(response_text, encoding="utf-8")
+                print(f"💾 结果已保存到: {output_file}")
+                
             print("=" * 70)
             
         # 错误处理
         except asyncio.TimeoutError:
-            raise RuntimeError("请求超时")
-            # sys.exit(1) 类方法不应该直接调用sys.exit()
+            raise RuntimeError(
+                "请求超时(>60秒)\n"
+                "可能原因:\n"
+                "1. 网络连接不稳定\n"
+                "2. 代码文件过大\n"
+                "3. API服务响应慢\n"
+                "建议: 尝试分析更小的代码段"
+            )
         except aiohttp.ClientError as e:
-            raise RuntimeError(f"网络错误: {e}")
+            raise RuntimeError(
+                f"网络连接错误: {e}\n"
+                "请检查:\n"
+                "1. 网络连接是否正常\n"
+                "2. 是否需要代理设置"
+            )
         except Exception as e:
-            raise RuntimeError(f"API调用失败: {e}")
+            raise RuntimeError(f"API调用失败: {type(e).__name__}: {e}")
     
 async def main():
     """主函数： 解析参数， 执行代码分析"""
@@ -277,6 +385,13 @@ async def main():
         default=None
     )
     
+    # 添加 --output参数，添加保存结果功能
+    parser.add_argument(
+        "--output", "-o",
+        help="保存分析结果到文件",
+        default=None
+    )
+    
     # 解析参数
     args = parser.parse_args()
     
@@ -293,7 +408,7 @@ async def main():
         code = explainer.read_file(args.file, args.lines)
         
         # 解释代码
-        await explainer.explain_code(code, args.file, args.lines)
+        await explainer.explain_code(code, args.file, args.lines, args.output)
         
     except FileNotFoundError as e:
         print(f"❌ {e}", file=sys.stderr)  # 输出的标准错误流

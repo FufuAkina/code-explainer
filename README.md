@@ -59,3 +59,12 @@ code-explainer/
 - Prompt Engineering
 
 
+# V1: AI Code Explainer 功能增强
+
+> 增强一些基础功能
+
+## 功能增强
+
+- ✅ 添加进度条功能(tqdm)
+- ✅ 添加保存结果到文件功能
+- ✅ 添加粗略成本计算和token统计功能
