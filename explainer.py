@@ -18,12 +18,21 @@ import sys
 import json # 序列化/反序列化
 from pathlib import Path
 
-import  aiohttp
+import aiohttp
+import tiktoken
 from tqdm import tqdm # 加进度条功能
 # from anthropic import AsyncAnthropic  不兼容DEEPSEEK
 
 from config import Config
 
+# 自定义异常类型
+class RetryableError(Exception):
+    """可重试的错误"""
+    pass
+
+class NonRetryableError(Exception):
+    """不可重试的错误"""
+    pass
 class CodeExplainer:
     """代码解释器: 调用AI分析代码"""
     
@@ -39,7 +48,8 @@ class CodeExplainer:
             "Authorization": f"Bearer {Config.API_KEY}",
             "Content-Type": "application/json"
         }
-
+        self.encoding = tiktoken.get_encoding("cl100k_base")
+        
         print("✅ 代码解释器初始化成功\n")
         
     def read_file(self, file_path: str, line_range: str = None) -> str:
@@ -139,7 +149,7 @@ class CodeExplainer:
         if line_range:
             location += f"(第 {line_range} 行)"
             
-        prompt = f"""请作为资深代码审查专家,分析一下Python代码:
+        prompt = f"""分析一下Python代码:
         
         **代码位置**: {location}
 
@@ -161,13 +171,8 @@ class CodeExplainer:
         return prompt
     
     def _estimate_tokens(self, text: str) -> int:
-        """粗略估计token数(1 token ≈ 1.5个中文字符)"""
-        chinese_chars = len([c for c in text if '\u4e00' <= c <= "\u9fff"]) # Unicode中文字符范围
-        english_chars = len([c for c in text if c.isalpha()])
-        
-        # 中文: 1.5字符/token, 英文: 4字符/token
-        estimated = (chinese_chars / 1.5) + (english_chars / 4)
-        return int(estimated)
+        """使用tiktoken精确计算token数"""
+        return len(self.encoding.encode(text))
     
     def _calculate_cost(self, input_tokens: int, output_tokens: int) -> dict:
         """计算API调用成本
@@ -213,11 +218,13 @@ class CodeExplainer:
         # ✅ 用于保存结果
         full_response = []
         char_count = 0
+        output_tokens = 0  # 从API获取精确值
         
         try:
             # ✅ 构建请求payload(OpenAI格式)
             payload = {
                 "model": Config.MODEL,
+                "system": "你是一位拥有10年Python开发经验的资深工程师，擅长发现代码中的边界条件问题和性能瓶颈。",
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": Config.MAX_TOKENS,
                 "temperature": Config.TEMPERATURE,
@@ -239,38 +246,35 @@ class CodeExplainer:
                         self.api_url,
                         headers=self.headers,
                         json=payload,
-                        timeout=aiohttp.ClientTimeout(total=60)
+                        timeout=aiohttp.ClientTimeout(
+                            total=120,    # 总超时
+                            connect=10,   # 连接超时
+                            sock_read=30, # 读取超时
+                            )
                     ) as  response:
                         
                         # 检查HTTP状态码
                         if response.status != 200:
                             error_text = await response.text()
                             
-                            # ✅ 替换成详细错误处理
-                            if response.stats == 401:
-                                raise RuntimeError(
-                                    "API认证失败\n"
-                                    "请检查:\n"
-                                    "1. .env文件中的DEEPSEEK_API_KEY是否正确\n"
-                                    "2. API Key是否有效（未过期/未欠费）"
-                                )
+                            # 1. HTTP状态码分类
+                            if response.status == 400:
+                                # 客户端错误 - 不应重试
+                                raise ValueError("请求参数错误，请检查输入")
+                            elif response.status == 401:
+                                # 认证错误 - 不应重试
+                                raise RuntimeError("API Key无效")
                             elif response.status == 429:
-                                raise RuntimeError(
-                                    "请求频率超限\n"
-                                    "请稍后再试，或升级API套餐"
-                                )
-                            elif response.status == 500:
-                                raise RuntimeError(
-                                    "服务器错误\n"
-                                    "Deepseek服务暂时不可用，请稍后重试"
-                                )
+                                # 速率限制 - 应该重试（带退避）
+                                retry_after = response.headers.get("Retry-After", 60)
+                                raise RetryableError(f"速率限制，{retry_after}秒后重试")
+                            elif response.status >= 500:
+                                # 服务器错误 - 应该重试
+                                raise RetryableError("服务器错误，稍后重试")
                             else:
-                                raise RuntimeError(
-                                    f"HTTP {response.status}: {error_text}\n"
-                                    "详细错误信息请查看上方"
-                                )
-                            
-                        
+                                # 其他错误
+                                raise RuntimeError(f"HTTP {response.status}: {error_text}")
+                                                   
                         # ✅ 流式读取响应（SSE格式）
                         # 改进： 按行读取
                         buffer = ""
@@ -297,7 +301,20 @@ class CodeExplainer:
                                 # 解析JSON
                                 chunk = json.loads(data)
                                 
-                                # 提取内容(OpenAI格式)
+                                 # ✅ 1.检查是否是错误世间
+                                if chunk.get("type") == "error":
+                                    error_info = chunk.get("error", {})
+                                    error_type = error_info.get("type")
+                                    error_msg = error_info.get("message")
+                                    
+                                    if error_type == "overloaded_error":
+                                        raise RetryableError(f"服务器过载: {error_msg}\n建议稍后重试")
+                                    elif error_type == "rate_limit_error":
+                                        raise RetryableError(f"速率限制: {error_msg}\n建议降低请求频率")
+                                    else:
+                                        raise RuntimeError(f"API错误: {error_msg}")
+                                                            
+                                # ✅ 2.处理正常内容
                                 if "choices" in chunk and len(chunk["choices"]) > 0 :
                                     delta = chunk["choices"][0].get("delta", {})
                                     content = delta.get("content", "")
@@ -310,14 +327,26 @@ class CodeExplainer:
                                         full_response.append(content) # 收集响应
                                         char_count += len(content)
                                         
+                                # ✅ 3.处理 token 使用量统计
+                                if "usage" in chunk:
+                                    usage = chunk["usage"]
+                                    if "prompt_tokens" in usage:
+                                        input_tokens = usage["prompt_tokens"]
+                                    if "completion_tokens" in usage:
+                                        output_tokens = usage["completion_tokens"]
+                                        
                             except json.JSONDecodeError as e:
                                 #忽略无效JSON行
                                 print(f"\n⚠️  警告: 跳过无效JSON数据", file=sys.stderr)
                                 continue
             
-            # 计算输出token  
+            # 不需要计算， 直接从API的SSE流中获取  
             response_text = "".join(full_response)
-            output_tokens = self._estimate_tokens(response_text)
+            
+            if output_tokens == 0:
+                output_tokens = self._estimate_tokens(response_text)
+                print("⚠️  API未返回token统计，使用估算值", file=sys.stderr)
+            
                    
             print("\n\n" + "=" * 70)
             print("✅ 分析完成")

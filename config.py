@@ -19,7 +19,7 @@ class Config:
     
     # 请求参数
     MAX_TOKENS = 2000
-    TEMPERATURE = 0.7
+    TEMPERATURE = 0.3
     
     @classmethod
     def validate(cls) -> bool:

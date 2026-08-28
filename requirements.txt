@@ -1,6 +1,14 @@
-anthropic==0.42.0
-click==8.1.7
+# Core dependencies
 python-dotenv==1.0.1
-loguru==0.7.2
 aiohttp==3.9.5
-tpdm>=4.66.0
+
+# Token counting (V2)
+tiktoken>=0.5.0
+
+# Progress bar
+tqdm>=4.66.0
+
+# Optional dependencies (not used in current version)
+# anthropic==0.42.0
+# click==8.1.7
+# loguru==0.7.2
