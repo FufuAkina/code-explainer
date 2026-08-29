@@ -1,0 +1,40 @@
+性能分析以下Python代码:
+
+代码位置: {location}
+
+<performance_analysis>
+请从性能角度深入分析：
+
+<step name="性能测量"> 1. 时间复杂度分析（Big O） 2. 空间复杂度分析 3. 识别性能瓶颈（循环、递归、I/O操作） </step> <step name="瓶颈定位"> 对每个瓶颈说明： - 具体在哪一行/哪个函数 - 为什么会慢 - 在什么数据规模下会成为问题 </step> <step name="优化方案"> 提供具体优化建议，包括： 1. 算法优化（更好的数据结构、算法替换） 2. 代码优化（减少重复计算、缓存中间结果） 3. 并发优化（异步、多线程、多进程） 4. 优化前后的性能对比估算 </step> <step name="代码示例"> 展示优化后的代码实现 </step> </performance_analysis>
+代码:
+
+
+{code}
+<few_shot_examples>
+示例分析格式：
+
+🎯 性能瓶颈
+位置: 第42行 for item in large_list:
+问题: O(n²) 嵌套循环
+影响: 当 n > 1000 时响应时间 > 5秒
+
+💡 优化方案
+策略: 使用哈希表替代线性查找
+复杂度: O(n²) → O(n)
+代码:
+
+
+# 优化前
+for item in list1:
+    if item in list2:  # O(n)
+        ...
+        
+# 优化后
+set2 = set(list2)  # O(n)
+for item in list1:
+    if item in set2:  # O(1)
+        ...
+收益: n=10000 时，从 25秒 → 0.02秒
+</few_shot_examples>
+
+

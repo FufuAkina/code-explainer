@@ -24,6 +24,8 @@ from tqdm import tqdm # 加进度条功能
 # from anthropic import AsyncAnthropic  不兼容DEEPSEEK
 
 from config import Config
+from prompt_manager import PromptManager   # 提示词管理模块
+from retry_utils import retry, TokenBucket # 重试装饰器+速率限制器
 
 # 自定义异常类型
 class RetryableError(Exception):
@@ -49,9 +51,17 @@ class CodeExplainer:
             "Content-Type": "application/json"
         }
         self.encoding = tiktoken.get_encoding("cl100k_base")
-        
+        self.prompt_manager = PromptManager(Config.PROMPTS_DIR)
+        self.rate_limiter = None
+        if Config.RATE_LIMIT_ENABLED:
+            self.rate_limiter = TokenBucket(
+                rate=Config.RATE_LIMIT_RATE,
+                capacity=Config.RATE_LIMIT_CAPACITY
+            )
+            print(f"✅ 速率限制已启用: {Config.RATE_LIMIT_RATE} 请求/秒")
+
         print("✅ 代码解释器初始化成功\n")
-        
+
     def read_file(self, file_path: str, line_range: str = None) -> str:
         """
         读取文件内容
@@ -133,43 +143,6 @@ class CodeExplainer:
                 
             raise  # 重新抛出其他的异常(else情况)
         
-    def _build_prompt(self, code:str, file_path:str, line_range: str=None) -> str:
-        """
-        构建发送给AI的提示词
-        
-        Args:
-            code: 代码内容
-            file_path: 文件路径
-            line_range: 行范围
-            
-        Return:
-            完整的提示词
-        """
-        location = f"{file_path}"
-        if line_range:
-            location += f"(第 {line_range} 行)"
-            
-        prompt = f"""分析一下Python代码:
-        
-        **代码位置**: {location}
-
-        **分析要求**:
-        1. **功能说明**: 这段代码的主要功能是什么？
-        2. **逻辑分析**: 关键步骤和实现思路
-        3. **潜在问题**：
-            - 可能的bug（边界情况、空值处理等）
-            - 性能问题
-            - 代码质量问题
-        4. **改进建议**：具体的优化方案（附代码示例）
-
-        **代码**:
-        ```python
-        {code}
-        请用中文回答，重点突出实际问题和可行建议。
-        """
-        
-        return prompt
-    
     def _estimate_tokens(self, text: str) -> int:
         """使用tiktoken精确计算token数"""
         return len(self.encoding.encode(text))
@@ -195,8 +168,21 @@ class CodeExplainer:
         "total_cost_cny": total_cost,
         "total_cost_usd": total_cost / 7.2  # 假设汇率
     }
-    
-    async def explain_code(self, code:str, file_path:str, line_range: str = None, output_file: str = None):
+        
+    # 用装饰器包装API调用
+    @retry(
+        max_attempts=Config.RETRY_MAX_ATTEMPTS,
+        base_delay=Config.RETRY_BASE_DELAY,
+        max_delay=Config.RETRY_MAX_DELAY,
+        retryable_exceptions=(RetryableError, asyncio.TimeoutError, aiohttp.ClientError)
+    )
+    async def explain_code(
+        self,
+        code: str, 
+        file_path: str, 
+        line_range: str = None, 
+        output_file: str = None,
+        template: str = None):
         """
         调用AI解释代码(流式输出)
         
@@ -206,7 +192,12 @@ class CodeExplainer:
             line_range: 行范围
         """
         # 构建提示词
-        prompt = self._build_prompt(code, file_path, line_range)
+        template_name = template or Config.DEFAULT_TEMPLATE
+        prompt = self.prompt_manager.build_prompt(
+            template_name, code, file_path, line_range
+        )
+        print(f"📝 使用模板: {template_name}")
+        
         # 估算输入token
         input_tokens = self._estimate_tokens(prompt)
         
@@ -387,6 +378,134 @@ class CodeExplainer:
         except Exception as e:
             raise RuntimeError(f"API调用失败: {type(e).__name__}: {e}")
     
+    async def analyze_directory(
+        self,
+        directory: str,
+        pattern: str = "*.py",
+        output_dir: str = None,
+        template: str = None,
+        max_concurrent: int = 3
+    ) -> dict:
+        """批量分析目录中的所有 Python 文件
+        
+        Args:
+            directory: 目录路径
+            pattern: 文件匹配模式（默认 *.py）
+            output_dir: 输出目录（可选）
+            template: 提示词模板
+            max_concurrent: 最大并发数
+            
+        Returns:
+            分析结果汇总字典
+        """
+        # 查找所有匹配文件
+        dir_path = Path(directory)
+        if not dir_path.exists():
+            raise FileNotFoundError(f"目录不存在: {directory}")
+        
+        if not dir_path.is_dir():
+            raise ValueError(f"不是目录: {directory}")
+        
+        # 递归查找所有 Python 文件
+        files = list(dir_path.rglob(pattern))
+        
+        if not files:
+            print(f"⚠️  未找到匹配的文件: {pattern}")
+            return {"success":[], "failed": [], "total_cost": 0}
+        
+        print(f"\n📁 找到 {len(files)} 个文件")
+        print("=" * 70)
+        
+        # 创建输出目录
+        if output_dir:
+            output_path = Path(output_dir)
+            output_path.mkdir(parents=True, exist_ok=True)
+            
+        # 使用 Semaphore 限制并发数
+        semaphore = asyncio.Semaphore(max_concurrent)
+        
+        async def analyze_single_file(file_path: Path) -> dict:
+            """分析单个文件"""
+            async with semaphore: # 限制并发
+                try:
+                    print(f"\n🔍 正在分析: {file_path.relative_to(dir_path)}")
+                    
+                    # 读取代码
+                    code = file_path.read_text(encoding="utf-8")
+                    
+                    # 构建输出文件路径
+                    output_file = None
+                    if output_dir:
+                        relative_path = file_path.relative_to(dir_path)
+                        output_file = output_path / f"{relative_path.stem}_analysis.txt"
+                        output_file.parent.mkdir(parents=True, exist_ok=True)
+                        
+                    # 分析代码
+                    await self.explain_code(
+                        code,
+                        str(file_path),
+                        template=template,
+                        output_file=str(output_file) if output_file else None
+                    )
+                    
+                    return{
+                        "file": str(file_path),
+                        "status": "success",
+                        "error": None
+                    }
+                    
+                except Exception as e:
+                    print(f"❌ 分析失败: {file_path.name} - {e}", file=sys.stderr)
+                    return {
+                        "file": str(file_path),
+                        "status": "failed",
+                        "error": str(e)
+                    }
+
+        # 并发分析所有文件
+        print(f"\n🚀 开始批量分析（最大并发数: {max_concurrent}）...")
+        results = await asyncio.gather(
+            *[analyze_single_file(f) for f in files],
+            return_exceptions=True
+        )
+
+        # 统计结果
+        success = [r for r in results if isinstance(r, dict) and r["status"] == "success"]
+        failed = [r for r in results if isinstance(r, dict) and r["status"] == "failed"]
+        exceptions = [r for r in results if isinstance(r, Exception)]
+
+        # 打印汇总报告
+        print("\n" + "=" * 70)
+        print("📊 批量分析汇总报告")
+        print("=" * 70)
+        print(f"✅ 成功: {len(success)} 个文件")
+        print(f"❌ 失败: {len(failed) + len(exceptions)} 个文件")
+        print(f"📁 总计: {len(files)} 个文件")
+
+        if failed:
+            print("\n失败文件列表：")
+            for r in failed:
+                print(f"  • {Path(r['file']).name}: {r['error']}")
+
+        if exceptions:
+            print("\n异常文件列表:")
+            for i, e in enumerate(exceptions):
+                print(f"  • 文件 {i+1}: {e}")
+
+        if output_dir:
+            print(f"\n💾 分析结果已保存到: {output_dir}")
+
+        print("=" * 70)
+
+        return {
+            "success": success,
+            "failed": failed + [{"file": f"exception_{i}", "error":str(e)} for i, e in enumerate(exceptions)],
+            "total_files": len(files),
+            "success_count": len(success),
+            "failed_count": len(failed) + len(exceptions)
+        }
+    
+    
 async def main():
     """主函数： 解析参数， 执行代码分析"""
     # 创建命令行参数解析器
@@ -404,7 +523,22 @@ async def main():
     # 位置参数: 文件路径
     parser.add_argument(
         "file",
+        nargs='?',  # 改为可选
         help="要分析的Python代码文件"
+    )
+    
+    # 新增：目录分析参数
+    parser.add_argument(
+        "--directory", "-d",
+        help="批量分析目录中的所有Python文件",
+        default=None
+    )
+    # 新增： 并发数参数
+    parser.add_argument(
+        "--max-concurrent", "-c",
+        type=int,
+        help="批量分析时的最大并发数(默认 3)",
+        default=3
     )
     
     # 可选参数: 行范围
@@ -421,6 +555,14 @@ async def main():
         default=None
     )
     
+    # 添加 --template 参数
+    parser.add_argument(
+        "--template", "-t",
+        choices=["detailed", "concise", "performance"],
+        help="选择提示词模板(详细/简洁/性能优化)",
+        default=None
+    )
+    
     # 解析参数
     args = parser.parse_args()
     
@@ -433,11 +575,25 @@ async def main():
         # 创建解释器
         explainer = CodeExplainer()
         
-        # 读取代码
-        code = explainer.read_file(args.file, args.lines)
+        # 判断是目录分析还是单文件分析
+        if args.directory:
+            # 批量分析目录
+            await explainer.analyze_directory(
+                directory=args.directory,
+                output_dir=args.output,
+                template=args.template,
+                max_concurrent=args.max_concurrent
+            )
+        elif args.file:
+            # 单文件分析
+            code = explainer.read_file(args.file, args.lines)
+            await explainer.explain_code(
+                code, args.file, args.lines, args.output, args.template
+                )
+        else:
+            parser.print_help()
+            sys.exit(1)
         
-        # 解释代码
-        await explainer.explain_code(code, args.file, args.lines, args.output)
         
     except FileNotFoundError as e:
         print(f"❌ {e}", file=sys.stderr)  # 输出的标准错误流

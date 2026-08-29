@@ -21,6 +21,20 @@ class Config:
     MAX_TOKENS = 2000
     TEMPERATURE = 0.3
     
+    # 提示词模板配置
+    DEFAULT_TEMPLATE = "detailed"   # 默认使用详细分析模板
+    PROMPTS_DIR = "prompts"         # 提示词目录
+    
+    # 重试机制配置
+    RETRY_MAX_ATTEMPTS = 3   # 最大重试次数  
+    RETRY_BASE_DELAY = 1.0   # 基础延迟(秒)
+    RETRY_MAX_DELAY = 60.0   # 最大延迟(秒)
+    
+    # 速率限制配置
+    RATE_LIMIT_ENABLED = False  # 是否启用速率限制
+    RATE_LIMIT_RATE = 10.0      # 每秒最多请求数
+    RATE_LIMIT_CAPACITY = 10.0 # token桶容量
+    
     @classmethod
     def validate(cls) -> bool:
         """
