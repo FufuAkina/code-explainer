@@ -72,17 +72,19 @@ def retry(
                     return await func(*args, **kwargs)
                 
                 except retryable_exceptions as e:
-                    last_exception = e
+                    # 使用服务端的等待时间
+                    if getattr(e, "retry_after", None) is not None:
+                        delay = e.retry_after
+                        print(f"📋 使用服务器指定的等待时间: {delay}秒")
+                    else:
+                        delay = exponential_backoff_with_jitter(
+                            attempt,
+                            base_delay=base_delay,
+                            max_delay=max_delay
+                        )
                     
                     if attempt == max_attempts - 1:
                         raise
-                    
-                    # 计算延迟时间
-                    delay = exponential_backoff_with_jitter(
-                        attempt,
-                        base_delay=base_delay,
-                        max_delay=max_delay
-                    )
                     
                     # 调用重试回调：充重试机制中的"通知系统"
                     if on_retry:
@@ -121,8 +123,11 @@ class TokenBucket:
             await api_call()  # 自动限流
     """
     def __init__(self, rate: float, capacity: float = None):
+        if rate <= 0:
+            raise ValueError("rate 必须大于 0")
+        
         self.rate = rate
-        self.capacity = capacity or rate
+        self.capacity = rate if capacity is None else capacity
         self.tokens = self.capacity # 初始token
         self.last_update = time.monotonic()
         self._lock = asyncio.Lock()
@@ -143,6 +148,9 @@ class TokenBucket:
         Args:
             tokens: 需要的令牌数
         """
+        if tokens <= 0 or tokens > self.capacity:
+            raise ValueError("tokens必须位于0和capacity之间")
+        
         async with self._lock:
             while True:
                 self._refill()

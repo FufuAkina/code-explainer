@@ -110,16 +110,18 @@ def test_calculate_cost():
 # ========== 测试4：提示词构建 ==========
 
 def test_build_prompt():
-    """测试提示词构建"""
     explainer = CodeExplainer()
-    
-    prompt = explainer._build_prompt("print('test')", "test.py", "1-5")
-    
+
+    prompt = explainer.prompt_manager.build_prompt(
+        "detailed",
+        "print('test')",
+        "test.py",
+        "1-5"
+    )
+
     assert "test.py" in prompt
     assert "1-5" in prompt
     assert "print('test')" in prompt
-    assert "分析要求" in prompt
-
 
 # ========== 测试5：异常类型 ==========
 

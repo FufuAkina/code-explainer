@@ -30,8 +30,9 @@ from retry_utils import retry, TokenBucket # 重试装饰器+速率限制器
 # 自定义异常类型
 class RetryableError(Exception):
     """可重试的错误"""
-    pass
-
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
 class NonRetryableError(Exception):
     """不可重试的错误"""
     pass
@@ -182,7 +183,9 @@ class CodeExplainer:
         file_path: str, 
         line_range: str = None, 
         output_file: str = None,
-        template: str = None):
+        template: str = None,
+        session: aiohttp.ClientSession=None
+        ):
         """
         调用AI解释代码(流式输出)
         
@@ -215,8 +218,16 @@ class CodeExplainer:
             # ✅ 构建请求payload(OpenAI格式)
             payload = {
                 "model": Config.MODEL,
-                "system": "你是一位拥有10年Python开发经验的资深工程师，擅长发现代码中的边界条件问题和性能瓶颈。",
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [
+                    {
+                        "role": "system",
+                        "content":"你是一位拥有10年Python开发经验的资深工程师，擅长发现代码中的边界条件问题和性能瓶颈。"
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                    ],
                 "max_tokens": Config.MAX_TOKENS,
                 "temperature": Config.TEMPERATURE,
                 "stream": True   # 流式输出
@@ -232,104 +243,129 @@ class CodeExplainer:
                 ) as pbar:
                 
                 # ✅ 用 aiohttp 发起异步HTTP请求
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        self.api_url,
-                        headers=self.headers,
-                        json=payload,
-                        timeout=aiohttp.ClientTimeout(
-                            total=120,    # 总超时
-                            connect=10,   # 连接超时
-                            sock_read=30, # 读取超时
-                            )
-                    ) as  response:
+               
+                if self.rate_limiter:
+                    await self.rate_limiter.acquire()
+                    
+                async with session.post(
+                    self.api_url,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(
+                        total=120,    # 总超时
+                        connect=10,   # 连接超时
+                        sock_read=30, # 读取超时
+                        )
+                ) as  response:
+                    # 保存服务端等待时间
+                    retry_after = response.headers.get("Retry-After")
+                    
+                    try: 
+                        retry_after = float(retry_after) if retry_after else None
+                    except ValueError:
+                        retry_after = None
+                    
+                    # 检查HTTP状态码
+                    if response.status != 200:
+                        error_text = await response.text()
                         
-                        # 检查HTTP状态码
-                        if response.status != 200:
-                            error_text = await response.text()
-                            
-                            # 1. HTTP状态码分类
-                            if response.status == 400:
-                                # 客户端错误 - 不应重试
-                                raise ValueError("请求参数错误，请检查输入")
-                            elif response.status == 401:
-                                # 认证错误 - 不应重试
-                                raise RuntimeError("API Key无效")
-                            elif response.status == 429:
-                                # 速率限制 - 应该重试（带退避）
-                                retry_after = response.headers.get("Retry-After", 60)
-                                raise RetryableError(f"速率限制，{retry_after}秒后重试")
-                            elif response.status >= 500:
-                                # 服务器错误 - 应该重试
-                                raise RetryableError("服务器错误，稍后重试")
-                            else:
-                                # 其他错误
-                                raise RuntimeError(f"HTTP {response.status}: {error_text}")
-                                                   
-                        # ✅ 流式读取响应（SSE格式）
-                        # 改进： 按行读取
-                        buffer = ""
-                        async for line in response.content:
+                        # 1. HTTP状态码分类
+                        if response.status == 400:
+                            # 客户端错误 - 不应重试
+                            raise ValueError("请求参数错误，请检查输入")
                         
-                            line = line.decode('utf-8').strip()
-                            
-        
-                            # 跳过空行
-                            if not line:
-                                continue
-                            
-                            # SSE格式: 每行以"data: "开头
-                            if not line.startswith("data: "):
-                                continue
-                            
-                            data = line[6:]   # 去掉前缀
-                            
-                            # 检查结束标志    
-                            if data == "[DONE]":
-                                break
-                                
+                        elif response.status == 401:
+                            # 认证错误 - 不应重试
+                            raise RuntimeError("API Key无效")
+                        
+                        elif response.status == 429:
+                            # 速率限制 - 应该重试（带退避）
+                            retry_after = response.headers.get("Retry-After", 60)
                             try:
-                                # 解析JSON
-                                chunk = json.loads(data)
+                                retry_after = (
+                                    float(retry_after)
+                                    if retry_after is not None
+                                    else None
+                                )
+                            except ValueError:
+                                retry_after = None
+
+                            raise RetryableError(
+                                "请求频率过高",
+                                retry_after=retry_after
+                            )
+                            
+                        elif response.status >= 500:
+                            # 服务器错误 - 应该重试
+                            raise RetryableError("服务器错误，稍后重试")
+                        
+                        else:
+                            # 其他错误
+                            raise RuntimeError(f"HTTP {response.status}: {error_text}")
+                                                
+                    # ✅ 流式读取响应（SSE格式）
+                    # 改进： 按行读取
+                    buffer = ""
+                    async for line in response.content:
+                    
+                        line = line.decode('utf-8').strip()
+                        
+    
+                        # 跳过空行
+                        if not line:
+                            continue
+                        
+                        # SSE格式: 每行以"data: "开头
+                        if not line.startswith("data: "):
+                            continue
+                        
+                        data = line[6:]   # 去掉前缀
+                        
+                        # 检查结束标志    
+                        if data == "[DONE]":
+                            break
+                            
+                        try:
+                            # 解析JSON
+                            chunk = json.loads(data)
+                            
+                                # ✅ 1.检查是否是错误世间
+                            if chunk.get("type") == "error":
+                                error_info = chunk.get("error", {})
+                                error_type = error_info.get("type")
+                                error_msg = error_info.get("message")
                                 
-                                 # ✅ 1.检查是否是错误世间
-                                if chunk.get("type") == "error":
-                                    error_info = chunk.get("error", {})
-                                    error_type = error_info.get("type")
-                                    error_msg = error_info.get("message")
+                                if error_type == "overloaded_error":
+                                    raise RetryableError(f"服务器过载: {error_msg}\n建议稍后重试")
+                                elif error_type == "rate_limit_error":
+                                    raise RetryableError(f"速率限制: {error_msg}\n建议降低请求频率")
+                                else:
+                                    raise RuntimeError(f"API错误: {error_msg}")
+                                                        
+                            # ✅ 2.处理正常内容
+                            if "choices" in chunk and len(chunk["choices"]) > 0 :
+                                delta = chunk["choices"][0].get("delta", {})
+                                content = delta.get("content", "")
+                                
+                                # 实时输出
+                                if content:
+                                    pbar.update(len(content))
+                                    # ⭐ 使用 tqdm.write() 输出内容(防止与进度条混合)
+                                    pbar.write(content, end="")
+                                    full_response.append(content) # 收集响应
+                                    char_count += len(content)
                                     
-                                    if error_type == "overloaded_error":
-                                        raise RetryableError(f"服务器过载: {error_msg}\n建议稍后重试")
-                                    elif error_type == "rate_limit_error":
-                                        raise RetryableError(f"速率限制: {error_msg}\n建议降低请求频率")
-                                    else:
-                                        raise RuntimeError(f"API错误: {error_msg}")
-                                                            
-                                # ✅ 2.处理正常内容
-                                if "choices" in chunk and len(chunk["choices"]) > 0 :
-                                    delta = chunk["choices"][0].get("delta", {})
-                                    content = delta.get("content", "")
+                            # ✅ 3.处理 token 使用量统计
+                            if "usage" in chunk:
+                                usage = chunk["usage"]
+                                if "prompt_tokens" in usage:
+                                    input_tokens = usage["prompt_tokens"]
+                                if "completion_tokens" in usage:
+                                    output_tokens = usage["completion_tokens"]
                                     
-                                    # 实时输出
-                                    if content:
-                                        pbar.update(len(content))
-                                        # ⭐ 使用 tqdm.write() 输出内容(防止与进度条混合)
-                                        pbar.write(content, end="")
-                                        full_response.append(content) # 收集响应
-                                        char_count += len(content)
-                                        
-                                # ✅ 3.处理 token 使用量统计
-                                if "usage" in chunk:
-                                    usage = chunk["usage"]
-                                    if "prompt_tokens" in usage:
-                                        input_tokens = usage["prompt_tokens"]
-                                    if "completion_tokens" in usage:
-                                        output_tokens = usage["completion_tokens"]
-                                        
-                            except json.JSONDecodeError as e:
-                                #忽略无效JSON行
-                                print(f"\n⚠️  警告: 跳过无效JSON数据", file=sys.stderr)
-                                continue
+                        except json.JSONDecodeError as e:
+                            #忽略无效JSON行
+                            print(f"\n⚠️  警告: 跳过无效JSON数据", file=sys.stderr)
+                            continue
             
             # 不需要计算， 直接从API的SSE流中获取  
             response_text = "".join(full_response)
@@ -353,30 +389,31 @@ class CodeExplainer:
             
             # ✅ 保存到文件
             if output_file:
-                Path(output_file).write_text(response_text, encoding="utf-8")
+                await asyncio.to_thread(
+                   Path(output_file).write_text,
+                   response_text, 
+                   encoding="utf-8" 
+                )
+                
                 print(f"💾 结果已保存到: {output_file}")
                 
             print("=" * 70)
             
-        # 错误处理
-        except asyncio.TimeoutError:
-            raise RuntimeError(
-                "请求超时(>60秒)\n"
-                "可能原因:\n"
-                "1. 网络连接不稳定\n"
-                "2. 代码文件过大\n"
-                "3. API服务响应慢\n"
-                "建议: 尝试分析更小的代码段"
-            )
-        except aiohttp.ClientError as e:
-            raise RuntimeError(
-                f"网络连接错误: {e}\n"
-                "请检查:\n"
-                "1. 网络连接是否正常\n"
-                "2. 是否需要代理设置"
-            )
+        # 错误处理 -> 重试机制
+        except (RetryableError, asyncio.TimeoutError, aiohttp.ClientError):
+            raise
         except Exception as e:
-            raise RuntimeError(f"API调用失败: {type(e).__name__}: {e}")
+            raise NonRetryableError(
+                f"API 调用失败: {e}"
+            ) from e
+            
+        return {
+            "file": file_path,
+            "content": response_text,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cost": cost_info
+        }
     
     async def analyze_directory(
         self,
@@ -424,20 +461,29 @@ class CodeExplainer:
         # 使用 Semaphore 限制并发数
         semaphore = asyncio.Semaphore(max_concurrent)
         
-        async def analyze_single_file(file_path: Path) -> dict:
+        async def analyze_single_file(file_path: Path, session) -> dict:
             """分析单个文件"""
             async with semaphore: # 限制并发
                 try:
                     print(f"\n🔍 正在分析: {file_path.relative_to(dir_path)}")
                     
                     # 读取代码
-                    code = file_path.read_text(encoding="utf-8")
+                    code = await asyncio.to_thread(
+                        file_path.read_text,
+                        encoding="utf-8"
+                    )
                     
                     # 构建输出文件路径
                     output_file = None
                     if output_dir:
                         relative_path = file_path.relative_to(dir_path)
-                        output_file = output_path / f"{relative_path.stem}_analysis.txt"
+                        # 防止结果覆盖
+                        output_file = (
+                            output_path
+                            / relative_path.parent
+                            / f"{relative_path.stem}_analysis.txt"
+                        )
+                        
                         output_file.parent.mkdir(parents=True, exist_ok=True)
                         
                     # 分析代码
@@ -445,7 +491,8 @@ class CodeExplainer:
                         code,
                         str(file_path),
                         template=template,
-                        output_file=str(output_file) if output_file else None
+                        output_file=str(output_file) if output_file else None,
+                        session=session
                     )
                     
                     return{
@@ -464,10 +511,13 @@ class CodeExplainer:
 
         # 并发分析所有文件
         print(f"\n🚀 开始批量分析（最大并发数: {max_concurrent}）...")
-        results = await asyncio.gather(
-            *[analyze_single_file(f) for f in files],
-            return_exceptions=True
-        )
+        async with aiohttp.ClientSession(
+            headers=self.headers
+        ) as session:
+            results = await asyncio.gather(
+                *[analyze_single_file(f, session) for f in files],
+                return_exceptions=True
+            )
 
         # 统计结果
         success = [r for r in results if isinstance(r, dict) and r["status"] == "success"]
@@ -586,10 +636,24 @@ async def main():
             )
         elif args.file:
             # 单文件分析
-            code = explainer.read_file(args.file, args.lines)
-            await explainer.explain_code(
-                code, args.file, args.lines, args.output, args.template
-                )
+            code = await asyncio.to_thread(
+                explainer.read_file,
+                args.file,
+                args.lines
+            )
+            
+            async with aiohttp.ClientSession(
+                headers=explainer.headers
+            ) as session:
+                
+                await explainer.explain_code(
+                    code,
+                    args.file, 
+                    args.lines,
+                    args.output, 
+                    args.template,
+                    session=session
+                    )
         else:
             parser.print_help()
             sys.exit(1)
