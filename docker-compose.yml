@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  code-explainer:
+    build: .
+    image: coode-explainer:latest
+    container_name: code-explainer
+    env_file:
+      - . env_file
+    volumes:
+      # 挂载当前目录到容器的 /workspace
+      - ./:/workspace
+      # 挂载输出目录
+      - ./analysis_output:/output 
+    working_dir: /workspace
+    # 示例: 分析单个文件
+    command: ["test_code.py", "-o", "/output/result.txt"]
+
+  # 批量分析服务
+  batch-analyzer:
+    build: .
+    image: code-explainer:latest
+    container_name: batch-analyzer
+    env_file:
+      - .env
+    volumes:
+      - ./:/workspace
+      - ./analysis_output:/output 
+    working_dir: /workspace
+    # 示例: 批量分析
+    command: ["-d", "test_batch", "-o", "/output/batch_results"]

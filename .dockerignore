@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+
+# 测试和缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+
+# 输出文件（具体列出，不用 *.txt）
+batch_results/
+analysis_output/
+result.txt
+
+# Git
+.git/
+.gitignore
+
+# 环境变量
+.env
+
+# 测试文件（可选）
+test_*.py
+async_example/
+async_example.py
